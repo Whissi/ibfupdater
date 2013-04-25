@@ -1,0 +1,839 @@
+#!/bin/bash
+# Copyright 2013 Thomas D. <whissi@whissi.de>
+# 
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# DESCRIPTION:
+#   The ‘Intelligent Background File Updater’ updates any files via cURL supported
+#   protocols and takes care of saving bandwidth. It can preserve previous versions
+#   of a file, so you can roll back manually when you need to. It is intelligent
+#   because it supports caching (ETag and Last-modified header) to save bandwith. It
+#   supports logging to syslog via ‘logger’ and is optimized for being run by cron
+#   jobs.
+# 
+# USAGE:
+#   ibfupdater [OPTIONS] --output <file> <URL>
+# 
+#######################################################################################
+#            UTF-8 character set trigger because we cannot use a BOM: äößü€           #
+#######################################################################################
+
+##
+# Global variables
+
+# Read-only variables:
+declare -r      PROGRAM_NAME="ibfupdater" # The name of the application
+declare -r PROGRAM_SHORTNAME="ibfu"       # The short name of the application
+declare -r   PROGRAM_VERSION="0.9.0"      # The application's version number
+declare -r              OIFS="$IFS"       # Save the IFS if we need to restore
+
+# From <sysexits.h>
+declare -r     EX_OK=0   # Everything is fine. No error.
+declare -r  EX_ERROR=1   # General error.
+declare -r   EX_CURL=2   # cURL error.
+declare -r  EX_USAGE=64  # Command line error, e.g. invalid argument
+declare -r  EX_IOERR=74  # An error occurred while doing I/O on some file
+declare -r EX_CONFIG=78  # Something was found in an unconfigured or misconfigured state. 
+
+declare          IS_CONFIGURED=0 # Indicates if parse_options and do_check_config were called
+declare PREV_VERSION_TO_DELETE=  # Holds the old, ‘out rotated’ log file (if any)
+declare            WAS_UPDATED=0
+
+
+# Default configuration
+unset config
+declare -A config
+config[curl_options]=
+config[curl_ua]=
+config[debug]=0
+config[etag_enabled]=1
+config[force]=0
+config[keep]=0
+config[keep_working_dir]=0
+config[logger]=0
+config[meta_enabled]=0
+config[meta_suffix]="$PROGRAM_SHORTNAME-meta"
+config[output_file]=
+config[url]=
+config[quiet]=0
+config[verbose]=0
+
+
+main() {
+	parse_options "$@"
+	do_check_config
+	
+	do_setup_environment
+	
+	do_setup_curl
+	do_fetch_file
+	do_handle_curl_errors $?
+	do_handle_http_status
+	
+	cleanup
+	
+	local log_message=
+	if [[ $WAS_UPDATED -eq 0 ]] ; then
+		log_message="File ‘${config[output_file]}’ is already up-to-date"
+	else
+		log_message="File ‘${config[output_file]}’ successfully updated from ‘${config[url]}’"
+	fi
+	
+	log "$log_message"
+	
+	if [[ ${config[quiet]} -ne 1 ]] ; then
+		echo ""
+		echo "$log_message!"
+	fi
+}
+
+cleanup() {
+	[[ $IS_CONFIGURED -eq 0 ]] && return 0
+	
+	if [[ -n "${config[working_dir]}" && ${config[keep_working_dir]} -eq 1 ]] ; then
+		print_verbose "Keeping working directory ‘${config[working_dir]}’ ..."
+		return 0
+	elif [[ -n "${config[working_dir]}" && -d "${config[working_dir]}" ]] ; then
+		print_verbose "Removing working directory ..."
+		rm -rf "${config[working_dir]}"
+		return 0
+	fi
+	
+	
+	print_verbose "Nothing to cleanup - Working directory not set ?!"
+}
+
+##
+# Die.
+# 
+# Usage: die <exit_code> <message>
+die() {
+	local status=$1 
+	shift
+	
+	cleanup
+	
+	if [[ $IS_CONFIGURED -eq 1 ]] ; then
+		local log_message="Failed to update ‘${config[output_file]}’ from ‘${config[url]}’"
+		
+		log "$log_message"
+		
+		print_error ""
+		print_error "ERROR: $log_message:"
+	fi
+	
+	print_error ""
+	print_error "${@}"
+	
+	if [[ $IS_CONFIGURED -eq 1 ]] ; then
+		if [[ -s "${config[output_file]}" ]] ; then
+			stat_size=$(stat --format %s "${config[output_file]}")
+			stat_date=$(date --iso-8601=seconds --reference "${config[output_file]}")
+			print_error ""
+			print_error "But you still have an old version of ‘$stat_date’ in ‘${config[output_file]}’ ($stat_size bytes)!"
+		else
+			print_error ""
+			print_error "Warning: Be warned that the file ‘${config[output_file]}’ doesn't exist/is empty!"
+			print_error "         That's OK when it's the initial download that has been failed."
+		fi
+	fi
+	
+	
+	exit $status
+}
+
+##
+# Usage: die_if_missing_arg <arg> <arg_value>
+die_if_missing_arg() {
+	local error_msg="ERROR: Missing expected argument of ‘$1’ option/parameter."
+	
+	if [[ ! "$2" ]] ; then
+		die $EX_USAGE "$error_msg"
+	elif [[ "$1" != '--curl-options' && "$2" = -* ]] ; then
+		die $EX_USAGE "$error_msg"
+	fi
+}
+
+##
+# Check config for any logical errors.
+do_check_config() {
+	local has_error=0
+	
+	if [[ -z ${config[output_file]} ]] ; then
+		has_error=1
+		print_error "ERROR: Required parameter ‘--output <file>’ is missing!"
+	fi
+	
+	if [[ -z ${config[url]} ]] ; then
+		has_error=1
+		print_error "ERROR: No URL was given!"
+	fi
+	
+	if [[ ${config[verbose]} -eq 1 && ${config[quiet]} -eq 1 ]] ; then
+		has_error=1
+		print_error "ERROR: You cannot set verbose and quiet mode at the same time!"
+	fi
+	
+	if [[ $has_error != 0 ]] ; then
+		exit $EX_CONFIG
+	fi
+	
+	
+	IS_CONFIGURED=1
+}
+
+do_handle_curl_errors() {
+	[[ $1 -eq 0 ]] && return 0
+	
+	local has_error_log=0
+	[[ -s "${curl_args[log_error]}" ]] && has_error_log=1
+	
+	case "$1" in
+		127)
+			# cURL not found <http://tldp.org/LDP/abs/html/exitcodes.html>
+			die $EX_ERROR "cURL not found. Make sure cURL is installed and in your PATH variable!"
+			;;
+		
+		*)
+			if [[ $has_error_log -eq 1 ]] ; then
+				die $EX_CURL "$(cat "${curl_args[log_error]}")"
+			else
+				die $EX_CURL "Unknown cURL error occured. No error message available."
+			fi
+			;;
+	esac
+}
+
+do_handle_http_status() {
+	local http_status_code=$(cat "${curl_args[log_output]}")
+	
+	if [[ ${#http_status_code} -gt 3 ]] ; then
+		http_status_code=-1
+		print_verbose "Something went wrong: HTTP status code length was >3 - changed"
+	fi
+	
+	case "$http_status_code" in
+		200)
+			if [[ ! -e "${config[output_file_temp]}" ]] ; then
+				local error_message=
+				
+				error_message="Something went wrong. The file wasn't properly downloaded!"
+				if [[ -n ${config[curl_options]} ]] ; then
+					error_message="Something went wrong. The file wasn't properly downloaded! Check parameters, especially ‘--curl-options’!"
+				fi
+				
+				die $EX_ERROR "$error_message"
+			fi
+			
+			print_verbose "New file version downloaded"
+			do_rotate_file
+			do_update_file
+			;;
+		
+		304)
+			print_verbose "No new file version found - file is already up to date"
+			;;
+		-1)
+			if [[ -s "${curl_args[log_error]}" ]] ; then
+				die $EX_CURL "$(cat "${curl_args[log_error]}")"
+			else
+				die $EX_ERROR "Something went wrong. Couldn't determine HTTP status code. Check parameter quoting, especially for ‘--curl-options’ if set!"
+			fi
+			;;
+		
+		*)
+			die $EX_ERROR "Unsupported HTTP status code ‘$http_status_code’ was returned!"
+			;;
+	esac
+}
+
+do_fetch_file() {
+	unset curl_status
+	print_verbose "Fetching file from ‘${curl_args[url]}’ ..."
+	
+	if [[ ${config[debug]} -eq 1 && -n ${config[curl_options]} ]] ; then
+		# Disabling debugging because an invalid/unquoted cURL option could
+		# result in outputing shell code we don't want to execute!
+		set +x
+		print_verbose "Debug mode temporarily turned off to prevent cURL from executing arbitrary shell code"
+	fi
+	
+	curl \
+		--user-agent "${curl_args[user_agent]}" \
+		--connect-timeout 60 \
+		--max-time 60 \
+		--retry 2 \
+		--fail \
+		--location \
+		--compressed \
+		${config[curl_options]:+${config[curl_options]} }\
+		--silent \
+		--show-error \
+		--stderr "${curl_args[log_error]}" \
+		--write-out %{http_code} \
+		${curl_args[dump]:+--dump-header "${curl_args[dump]}" }\
+		${curl_args[etag]:+--header 'If-None-Match: "'"${curl_args[etag]}"'"' }\
+		${curl_args[last_modified]:+--time-cond "'${curl_args[last_modified]}'" }\
+		--output "${curl_args[output]}" \
+		--url "${curl_args[url]}" \
+		1>"${curl_args[log_output]}" \
+		2>"${curl_args[log_error]}"
+	
+	if [[ -n ${config[curl_options]} && ${config[debug]} -eq 1 ]] ; then
+		# Reactivating debug mode
+		set -x
+		print_verbose "Debug mode reactivated"
+	fi
+	
+	curl_status=$?
+	
+	
+	return $curl_status
+}
+
+do_rotate_file() {
+	if [[ ${config[keep]} -eq 0 ]] ; then
+		print_verbose "Not preserving any previous versions because ‘--keep’ is not set"
+		return 0
+	fi
+	
+	local has_to_rotate=0
+		
+	# From <http://mywiki.wooledge.org/BashFAQ/020>
+	unset files i
+	i=0
+	while IFS= read -r -u 3 -d $'\0' file; do
+		files[i++]="$file"
+	done 3< <(find "${config[output_file]}"?(.+([[:digit:]])) -maxdepth 0 -print0 -type f 2>/dev/null | sort --zero-terminated -V 2>/dev/null)
+	unset i file
+	IFS="$OIFS"
+	
+	unset previous_versions
+	declare -a previous_versions
+	if [[ "${#files[@]}" -gt 0 && "${files[0]}" == "${config[output_file]}" ]] ; then
+		for ((i=0; i<=${config[keep]}; i++)); do
+			if [[ -z "${files[$i]}" ]] ; then
+				# Array key does not exist (=we have less previous versions as wanted)
+				break
+			fi
+			
+			case "${files[$i]}" in
+				"${config[output_file]}")
+					;&
+				"${config[output_file]}.$i")
+					previous_versions[$i]="${files[$i]}"
+					;;
+			esac
+		done
+		unset i
+	fi
+	unset files
+	
+	if [[ "${#previous_versions[@]}" -gt 0 ]] ; then
+		print_verbose "Need to rotate ${#previous_versions[@]} previous versions"
+		
+		for ((i=${#previous_versions[@]}; i>0; i--)); do
+			file_new="${config[output_file]}.$i"
+			file_old="${previous_versions[$[i - 1]]}"
+			
+			if [[ $i -gt "${config[keep]}" ]] ; then
+				unset PREV_VERSION_TO_DELETE
+				declare -g -r PREV_VERSION_TO_DELETE="$file_new"
+			fi
+			
+			print_verbose "Renaming ‘$file_old’ to ‘$file_new’ ..."
+			
+			if [[ -e "$file_new" ]] ; then
+				# Destination file exists!
+				# We don't know why:
+				# - Did we create the file (e.g. user has changed (decremented) the "--keep" value)?
+				# - Is it another file/directory having just the same name?
+				# - Is it a link?
+				# We cannot decide, so stop here before we destroy something!
+				die $EX_ERROR "Couldn't rename ‘$file_old’ to ‘$file_new’ because destination file already exist!"
+			fi
+			
+			mv "$file_old" "$file_new"
+			if [[ $? -ne 0 ]] ; then
+				# Not sure how this can ever happen ...
+				die $EX_IOERR "Couldn't rename file ‘$file_old’ to ‘$file_new’!"
+			fi
+		done
+		unset i file_new file_old
+	else
+		print_verbose "Nothing to rotate"
+	fi
+}
+
+##
+# Validates and sets the config[output_*] values.
+# 
+# Error codes:
+#   1: General error
+#   2: Permission denied
+#   3: Not supported filename
+#   4: Directory isn't writable
+#   5: File isn't writable
+do_set_output_file() {
+	[ -z "$1" ] && return 1
+	
+	local filename= dirname= rpath=
+	
+	if hash realpath 2>/dev/null ; then
+		# Use ‘realpath’ when available because it won't resolve symlinks,
+		# so the returned path is more ‘accurate’ to user's input
+		print_verbose "Using ‘realpath’ to verify output value ..."
+		rpath=$(realpath --no-symlinks --quiet "$1" 2> /dev/null)
+	else
+		print_verbose "Using ‘readlink’ to verify output value ..."
+		rpath=$(readlink --canonicalize --quiet "$1" 2> /dev/null)
+	fi
+	
+	if [[ $? -ne 0 ]] ; then
+		return 2
+	fi
+	
+	local pattern='^.*('"${config[meta_suffix]}"'|\.)$'
+	filename=$(basename "$rpath" 2>/dev/null)
+	if [[ $? -ne 0 ]] ; then
+		# Can ‘basename’ really fail?
+		return 1
+	elif [[ "$filename" =~ $pattern ]] ; then
+		return 3
+	fi
+	
+	dirname=$(dirname "$rpath" 2>/dev/null)
+	if [[ $? -ne 0 ]] ; then
+		# Can ‘dirname’ really fail?
+		return 1
+	fi
+	
+	if [[ -e $dirname && ! -w $dirname ]] ; then
+		return 4
+	fi
+	
+	if [[ -e $rpath && ! -w $rpath ]] ; then
+		return 5
+	fi
+	
+	config[output_filename]=$filename
+	config[output_dirname]=$dirname
+	config[output_file]=$rpath
+	
+	
+	return 0
+}
+
+do_setup_curl() {
+	unset curl_args
+	declare -g -A curl_args
+	curl_args[output]="${config[output_file_temp]}"
+	curl_args[url]="${config[url]}"
+	curl_args[user_agent]="${config[curl_ua]:-Mozilla/5.0 (compatible; $PROGRAM_NAME/$PROGRAM_VERSION; +https://github.com/Whissi/ibfupdater/)}"
+	curl_args[dump]="${config[meta_file_temp]}"
+	curl_args[etag]=
+	curl_args[last_modified]=
+	curl_args[log_output]="${config[working_dir]}/curl_output.log"
+	curl_args[log_error]="${config[working_dir]}/curl_error.log"
+	
+	# Make URL safe for use
+	curl_args[url]=${curl_args[url]// /%20} # cURL doesn't handle whitespaces like wget on its own
+	
+	# Cache support
+	if [[ ${config[force]} -eq 1 ]] ; then
+		print_verbose "Skipping cache due to ‘--force’ option"
+	elif [[ ${config[meta_enabled]} -eq 0 ]] ; then
+		print_verbose "Skipping cache because option ‘--enable-caching’ was not set"
+	elif [[ ! -e "${config[meta_file]}" ]] ; then
+		print_verbose "Skipping cache because no meta data found"
+	elif [[ ! -e "${config[output_file]}" ]] ; then
+		print_verbose "Skipping cache because output file doesn't exist (first run?)"
+		
+		rm -f "${config[meta_file]}"
+		[[ $? -ne 0 ]] && die $EX_IOERR "ERROR: Couldn't remove orphaned meta data file ‘${config[meta_file]}’"
+		
+		print_verbose "Orphan meta data file removed"
+	else
+		local has_useable_cache_header=0 etag= last_modified=
+		
+		cat "${config[meta_file]}" | tr -d '\r' > "${config[meta_file_prev]}"
+		
+		if [[ ${config[etag_enabled]} -eq 1 ]] ; then
+			etag=$(sed -rn 's/^etag: "(.*)"/\1/ip' "${config[meta_file_prev]}")
+		else
+			print_verbose "Skipping ETag due to ‘--disable-etag’ option"
+		fi
+		
+		if [[ -n "$etag" ]] ; then
+			has_useable_cache_header=1
+			curl_args[etag]="$etag"
+			print_verbose "Will use ‘ETag’ value ‘$etag’ for cache validation"
+		else
+			# Last-modified fallback
+			last_modified=$(sed -rn 's/^last-modified: (.*)/\1/ip' "${config[meta_file_prev]}")
+			if [[ -n "$last_modified" ]] ; then
+				has_useable_cache_header=1
+				curl_args[last_modified]="$last_modified"
+				print_verbose "Will use ‘Last-modified’ value ‘$last_modified’ for cache validation"
+			fi
+		fi
+		
+		[[ $has_useable_cache_header -eq 0 ]] && print_verbose "Skipping cache because no suitable method was found"
+	fi
+}
+
+do_setup_environment() {
+	shopt -s extglob
+	
+	local tmp_target=$(mktemp -d -t "$PROGRAM_SHORTNAME.XXXXXXXXXX")
+	verify_working_dir "$tmp_target"
+	
+	# Setting variables
+	config[working_dir]="$tmp_target"                                 # Working directory
+	config[output_file_temp]="${config[working_dir]}/file.temp"       # File where we temporarly store the new version
+	config[meta_file]="${config[output_file]}.${config[meta_suffix]}" # Full file path, where we finally store the meta data
+	config[meta_file_temp]="${config[working_dir]}/meta.new"          # Full file path, where we temporarly store the new meta data
+	config[meta_file_prev]="${config[working_dir]}/meta.prev"         # Full file path, where we temporarly store the meta data of the previous version
+	
+	trap "die $? 'Terminated!'" SIGHUP SIGINT SIGQUIT SIGABRT SIGTERM
+}
+
+do_update_file() {
+		if [[ ${config[keep]} -eq 0 ]] ; then
+			mv --force "${config[output_file_temp]}" "${config[output_file]}"
+		else
+			# No forced move when ‘--keep’ was set because the previous
+			# existing version with the same name should be already rotated!
+			# If not, that's an additional error check.
+			mv "${config[output_file_temp]}" "${config[output_file]}"
+		fi
+		
+		if [[ $? -eq 0 ]] ; then
+			print_verbose "New version successfully installed in ‘${config[output_file]}’"
+		else
+			die $EX_IOERR "Couldn't install new version of ‘${config[output_file]}’"
+		fi
+		
+		if [[ ${config[meta_enabled]} -eq 1 ]] ; then
+			mv --force "${config[meta_file_temp]}" "${config[meta_file]}"
+			if [[ $? -eq 0 ]] ; then
+				print_verbose "Meta data file successfully installed in ‘${config[meta_file]}’"
+			else
+				die $EX_IOERR "Couldn't install meta data file to ‘${config[meta_file]}’"
+			fi
+		elif [[ -e "${config[meta_file]}" ]] ; then
+			rm "${config[meta_file]}"
+			if [[ $? -eq 0 ]] ; then
+				print_verbose "Old meta data file removed because option ‘--enable-caching’ was not set"
+			else
+				die $EX_IOERR "Couldn't remove old meta data file ‘${config[meta_file]}’"
+			fi
+		fi
+		
+		if [[ -n "$PREV_VERSION_TO_DELETE" ]] ; then
+			rm "$PREV_VERSION_TO_DELETE"
+			if [[ $? -eq 0 ]] ; then
+				print_verbose "Old, now ‘out rotated’ previous version ‘$PREV_VERSION_TO_DELETE’ removed"
+			else
+				die $EX_IOERR "Couldn't remove old, now ‘out rotated’ previous version ‘$PREV_VERSION_TO_DELETE’"
+			fi
+		fi
+		
+		WAS_UPDATED=1
+}
+
+has_unsupported_curl_option() {
+	[[ -z "$1" ]] && return 1
+	
+	# The following options are known to break this script
+	local pattern='^([ ]?(-C|--continue-at|-J|--remote-header-name|-o.*|--output|--remote-name-all|-T|--upload-file|-V|--version|-M|--manual|-h|--help|-A|--user-agent))+( .*)?$'
+	if [[ "$1" =~ $pattern ]] ; then
+		return 0
+	fi
+	
+	
+	return 1
+}
+
+is_integer() {
+	[[ -z "$1" ]] && return 1
+	
+	local pattern='^[1-9]{1}[[:digit:]]*$'
+	if [[ "$1" =~ $pattern ]] ; then
+		return 0
+	fi
+	
+	
+	return 1
+}
+
+log() {
+	[[ ${config[logger]} -eq 1 ]] && logger -t "$PROGRAM_NAME" "$@"
+}
+
+##
+# Usage: parse_options args
+#        args: Arguments
+parse_options() {
+	local has_error=0 has_url=0
+	
+	IS_CONFIGURED=0 # Make sure that do_check_config() will be called
+	
+	while [ "$1" ]; do
+		case "$1" in
+			--curl-options)
+				die_if_missing_arg "$1" "$2"
+				shift
+				if has_unsupported_curl_option "$1"; then
+					print_error ""
+					print_error "ERROR: Not supported cURL option(s) detected."
+					print_error ""
+					print_error "See ‘$PROGRAM_NAME --help’ for a list of unsupported options."
+					exit $EX_USAGE;
+				else
+					config[curl_options]="$1"
+					shift
+				fi
+				;;
+			--debug)
+				shift
+				config[debug]=1
+				set -xv
+				;;
+			--disable-etag)
+				shift
+				config[etag_enabled]=0
+				;;
+			--enable-caching)
+				shift
+				config[meta_enabled]=1
+				;;
+			--force)
+				shift
+				config[force]=1
+				;;
+			--keep)
+				die_if_missing_arg "$1" "$2"
+				shift
+				if is_integer "$1"; then
+					config[keep]="$1"
+					shift
+				else
+					print_error ""
+					print_error "ERROR: Invalid ‘keep’ value ‘$1’ given!"
+					print_error "The value must be an integer."
+					exit $EX_USAGE;
+				fi
+				;;
+			--keep-working-dir)
+				shift
+				config[keep_working_dir]=1
+				;;
+			--logger)
+				shift
+				config[logger]=1
+				;;
+			--output)
+				die_if_missing_arg "$1" "$2"
+				shift
+				
+				do_set_output_file "$1"
+				set_output_status=$?
+				
+				if [[ $set_output_status -ne 0 ]] ; then
+					print_error ""
+					print_error "ERROR: Invalid ‘output’ value ‘$1’ given!"
+					
+					case $set_output_status in
+						2)
+							print_error "Is the file accessible? Check file permission."
+							;;
+						3)
+							print_error "The filename must not end with ‘.’ or ‘${config[meta_suffix]}’."
+							;;
+						4)
+							print_error "Output directory isn't writable."
+							;;
+						5)
+							print_error "Output file isn't writeable."
+							;;
+					esac
+					
+					exit $EX_USAGE;
+				fi
+				unset set_output_status
+				
+				shift
+				;;
+			--user-agent)
+				die_if_missing_arg "$1" "$2"
+				shift
+				config[curl_ua]="$1"
+				shift
+				;;
+			--verbose)
+				shift
+				config[verbose]=1
+				print_program_header
+				;;
+			--version)
+				print_version
+				exit $EX_OK
+				;;
+			--quiet)
+				shift
+				config[quiet]=1
+				;;
+			--help)
+				print_usage
+				exit $EX_OK
+				;;
+			--*)
+				print_error ""
+				print_error "Error: Unknown argument ‘$1’ supplied!"
+				exit $EX_USAGE;
+				;;
+			*)
+				if [[ $has_url -ne 0 ]] ; then
+					die $EX_USAGE "ERROR: Sorry, this script doesn't support multiple URLs!"
+				fi
+				
+				config[url]="$1"
+				has_url=1
+				shift
+				;;
+		esac
+	done
+}
+
+##
+# Prints an error message to /dev/stderr.
+print_error() {
+	echo -e "$@" >> /dev/stderr
+}
+
+print_program_header() {
+	print_version
+	echo "Copyright (C) 2013 Thomas D."
+	echo ""
+}
+
+print_usage() {
+	echo "Usage: ${PROGRAM_NAME} [OPTIONS] --output <file> <URL>"
+	echo "Updates a given file from a given URL."
+	echo ""
+	echo "Options:"
+	echo "========"
+	echo "--curl-options <options>"
+	echo "	If you want to pass additional cURL options to the $PROGRAM_NAME,"
+	echo "	use this option."
+	echo ""
+	echo "	The following options are known to break the script and therefore are unsupported:"
+	echo ""
+	echo "	    * -C, --continue-at"
+	echo "	    * -J, --remote-header-name"
+	echo "	    * -o, --output"
+	echo "	    * --remote-name-all"
+	echo "	    * -T, --upload-file"
+	echo "	    * -A, --user-agent"
+	echo "	    * -V, --version"
+	echo "	    * -M, --manual"
+	echo "	    * -h, --help"
+	echo ""
+	echo "	Example:"
+	echo "	    $ ${PROGRAM_NAME} --curl-options '--user myuser1:secret' --output foo.dat http://example.org/list.dat"
+	echo ""
+	echo "	    This will fetch the given URL using the given credentials."
+	echo ""
+	echo "	Note:"
+	echo "	    If any addidional cURL option value contains special characters, use single quotes like"
+	echo "	    in the example or don't forget to escape!"
+	echo ""
+	echo "--debug"
+	echo "	This option enables the debug mode. Should be the first option for best results."
+	echo ""
+	echo "--disable-etag"
+	echo "	This option disables the usage of the ‘ETag’ cache validation method. In general, ETag should be"
+	echo "	preferred for cache validation, but some servers have changing ETags, although the file hasn't changed."
+	echo "	In that case, the ‘Last-modified’ header is your only option (when supported by the server)."
+	echo ""
+	echo "--enable-caching"
+	echo "	This option enables the intelligent update mechanism. When this option is set,"
+	echo "	the application will download the file only if really needed. Therefore, we need"
+	echo "	to save meta data next to the file (‘<file>.su-meta’)."
+	echo ""
+	echo "--force"
+	echo "	Forces an update, even when the server says you already have the latest version."
+	echo ""
+	echo "--keep <num>"
+	echo "	Sets the number of previous downloaded versions you want to keep. When a new version"
+	echo "	was downloaded, the previous downloaded file wil be renamed to ‘<file>.1’."
+	echo ""
+	echo "--keep-working-dir"
+	echo "	When set, $PROGRAM_NAME won't remove the working directory at the end."
+	echo "	Useful for debugging."
+	echo ""
+	echo "--logger"
+	echo "	Enables the usage of ‘logger’. Will only log summaries about what happened (successful"
+	echo "	or unsuccessful file updates), no error messages."
+	echo ""
+	echo "--quiet"
+	echo "	No output. Useful for cron jobs."
+	echo ""
+	echo "--user-agent <agent string>"
+	echo "	Sets the cURL user agent."
+	echo ""
+	echo "--verbose"
+	echo "	Enables verbose output."
+	echo ""
+	echo "Parameters:"
+	echo "==========="
+	echo "--output <file>"
+	echo "	The path including the filename where the downloaded file should be stored."
+	echo ""
+	echo "--version"
+	echo "	Output version information and exit."
+	echo ""
+	echo "--help"
+	echo "	Display this help text and exit."
+	echo ""
+}
+
+##
+# Prints a message to /dev/stdout when verbose mode is enabled.
+print_verbose() {
+	[[ ${config[verbose]} -ne 1 ]] && return
+	
+	echo "$@" >> /dev/stdout
+}
+
+print_version() {
+	echo "$PROGRAM_NAME v$PROGRAM_VERSION"
+}
+
+##
+# Usage: verify_working_dir <path>
+verify_working_dir() {
+	if [[ ! $1 ]] ; then
+		die 1 'ERROR: Temporary file path is unset!'
+	elif [[ -d $1 ]] ; then
+		cd "$1"
+	else
+		die $EX_IOERR "ERROR: Unable to create/change into working directory ‘$1’!"
+	fi
+	
+	print_verbose "Working directory is set to ‘$PWD’"
+}
+
+main "$@"
