@@ -383,8 +383,9 @@ do_rotate_file() {
 #   1: General error
 #   2: Permission denied
 #   3: Not supported filename
-#   4: Directory isn't writable
-#   5: File isn't writable
+#   4: Directory doesn't exist
+#   5: Directory isn't writable
+#   6: File isn't writable
 do_set_output_file() {
 	[ -z "$1" ] && return 1
 	
@@ -419,12 +420,16 @@ do_set_output_file() {
 		return 1
 	fi
 	
-	if [[ -e $dirname && ! -w $dirname ]] ; then
+	if [[ ! -d $dirname ]] ; then
 		return 4
 	fi
 	
-	if [[ -e $rpath && ! -w $rpath ]] ; then
+	if [[ ! -w $dirname ]] ; then
 		return 5
+	fi
+	
+	if [[ -e $rpath && ! -w $rpath ]] ; then
+		return 6
 	fi
 	
 	config[output_filename]=$filename
@@ -663,9 +668,12 @@ parse_options() {
 							print_error "The filename must not end with ‘.’ or ‘${config[meta_suffix]}’."
 							;;
 						4)
-							print_error "Output directory isn't writable."
+							print_error "Output directory doesn't exist."
 							;;
 						5)
+							print_error "Output directory isn't writable."
+							;;
+						6)
 							print_error "Output file isn't writeable."
 							;;
 					esac
