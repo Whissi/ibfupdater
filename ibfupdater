@@ -58,6 +58,7 @@ config[curl_options]=
 config[curl_ua]=
 config[debug]=0
 config[etag_enabled]=1
+config[remote-time_enabled]=1
 config[force]=0
 config[keep]=0
 config[keep_working_dir]=0
@@ -277,6 +278,7 @@ do_fetch_file() {
 		--fail \
 		--location \
 		--compressed \
+		${curl_args[remote_time]:+${curl_args[remote_time]} }\
 		${config[curl_options]:+${config[curl_options]} }\
 		--silent \
 		--show-error \
@@ -448,6 +450,7 @@ do_setup_curl() {
 	curl_args[user_agent]="${config[curl_ua]:-Mozilla/5.0 (compatible; $PROGRAM_NAME/$PROGRAM_VERSION; +https://github.com/Whissi/ibfupdater/)}"
 	curl_args[dump]="${config[meta_file_temp]}"
 	curl_args[etag]=
+	curl_args[remote_time]="--remote-time"
 	curl_args[last_modified]=
 	curl_args[log_output]="${config[working_dir]}/curl_output.log"
 	curl_args[log_error]="${config[working_dir]}/curl_error.log"
@@ -495,6 +498,12 @@ do_setup_curl() {
 		fi
 
 		[[ $has_useable_cache_header -eq 0 ]] && print_verbose "Skipping cache because no suitable method was found"
+	fi
+
+	# Remote time support
+	if [[ ${config[remote-time_enabled]} -eq 0 ]]; then
+		curl_args[remote_time]=
+		print_verbose "Won't set the downloaded file's timestamp to match the one on the remote server due to ‘--disable-remote-time’ option"
 	fi
 }
 
@@ -619,6 +628,10 @@ parse_options() {
 			--disable-etag)
 				shift
 				config[etag_enabled]=0
+				;;
+			--disable-remote-time)
+				shift
+				config[remote-time_enabled]=0
 				;;
 			--enable-caching)
 				shift
@@ -775,6 +788,11 @@ print_usage() {
 	echo "	This option disables the usage of the ‘ETag’ cache validation method. In general, ETag should be"
 	echo "	preferred for cache validation, but some servers have changing ETags, although the file hasn't changed."
 	echo "	In that case, the ‘Last-modified’ header is your only option (when supported by the server)."
+	echo ""
+	echo "--disable-remote-time"
+	echo "	By default, when a file is downloaded, it's timestamps are set to match those from the remote file."
+	echo "	However, it is sometimes useful to base the local file's timestamp on when it was actually downloaded;"
+	echo "	for that purpose, the ‘--disable-remote-time’ option has been provided."
 	echo ""
 	echo "--enable-caching"
 	echo "	This option enables the intelligent update mechanism. When this option is set,"
