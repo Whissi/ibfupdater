@@ -35,7 +35,7 @@
 # Read-only variables:
 declare -r      PROGRAM_NAME="ibfupdater" # The name of the application
 declare -r PROGRAM_SHORTNAME="ibfu"       # The short name of the application
-declare -r   PROGRAM_VERSION="0.9.2-pre"      # The application's version number
+declare -r   PROGRAM_VERSION="0.9.2"      # The application's version number
 declare -r              OIFS="$IFS"       # Save the IFS if we need to restore
 
 # From <sysexits.h>
