@@ -505,11 +505,11 @@ do_setup_environment() {
 	verify_working_dir "$tmp_target"
 
 	# Setting variables
-	config[working_dir]="$tmp_target"                                 # Working directory
-	config[output_file_temp]="${config[working_dir]}/file.temp"       # File where we temporarly store the new version
-	config[meta_file]="${config[output_file]}.${config[meta_suffix]}" # Full file path, where we finally store the meta data
-	config[meta_file_temp]="${config[working_dir]}/meta.new"          # Full file path, where we temporarly store the new meta data
-	config[meta_file_prev]="${config[working_dir]}/meta.prev"         # Full file path, where we temporarly store the meta data of the previous version
+	config[working_dir]="$tmp_target"                                                                # Working directory
+	config[output_file_temp]="${config[working_dir]}/file.temp"                                      # File where we temporarly store the new version
+	config[meta_file]="${config[output_dirname]}/.${config[output_filename]}.${config[meta_suffix]}" # Full file path, where we finally store the meta data
+	config[meta_file_temp]="${config[working_dir]}/meta.new"                                         # Full file path, where we temporarly store the new meta data
+	config[meta_file_prev]="${config[working_dir]}/meta.prev"                                        # Full file path, where we temporarly store the meta data of the previous version
 
 	trap "die $? 'Terminated!'" SIGHUP SIGINT SIGQUIT SIGABRT SIGTERM
 }
@@ -779,7 +779,7 @@ print_usage() {
 	echo "--enable-caching"
 	echo "	This option enables the intelligent update mechanism. When this option is set,"
 	echo "	the application will download the file only if really needed. Therefore, we need"
-	echo "	to save meta data next to the file (‘<file>.su-meta’)."
+	echo "	to save meta data next to the file (‘.<file>.${config[meta_suffix]}’)."
 	echo ""
 	echo "--force"
 	echo "	Forces an update, even when the server says you already have the latest version."
