@@ -35,7 +35,7 @@
 # Read-only variables:
 declare -r      PROGRAM_NAME="ibfupdater" # The name of the application
 declare -r PROGRAM_SHORTNAME="ibfu"       # The short name of the application
-declare -r   PROGRAM_VERSION="0.9.2"      # The application's version number
+declare -r   PROGRAM_VERSION="0.9.2-pre"      # The application's version number
 declare -r              OIFS="$IFS"       # Save the IFS if we need to restore
 
 # From <sysexits.h>
@@ -142,7 +142,7 @@ die() {
 			stat_size=$(stat --format %s "${config[output_file]}")
 			stat_date=$(date --iso-8601=seconds --reference "${config[output_file]}")
 			print_error ""
-			print_error "But you still have an old version of ‘$stat_date’ in ‘${config[output_file]}’ ($stat_size bytes)!"
+			print_error "However, ‘${config[output_file]}’ ($stat_size bytes) from ‘$stat_date’ exists (old version?)!"
 		else
 			print_error ""
 			print_error "Warning: Be warned that the file ‘${config[output_file]}’ doesn't exist/is empty!"
