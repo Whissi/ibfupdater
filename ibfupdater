@@ -35,7 +35,7 @@
 # Read-only variables:
 declare -r      PROGRAM_NAME="ibfupdater" # The name of the application
 declare -r PROGRAM_SHORTNAME="ibfu"       # The short name of the application
-declare -r   PROGRAM_VERSION="0.9.2"      # The application's version number
+declare -r   PROGRAM_VERSION="0.10.0"     # The application's version number
 declare -r              OIFS="$IFS"       # Save the IFS if we need to restore
 
 # From <sysexits.h>
@@ -194,6 +194,63 @@ do_check_config() {
 	IS_CONFIGURED=1
 }
 
+##
+# Check if downloaded file is really newer then existing file
+# in case server doesn't provide any useful headers
+do_check_if_downloaded_file_is_newer() {
+	if [[ ! -e "${config[output_file]}" ]] ; then
+		print_verbose "Cannot check if downloaded file is newer than output file because output file does not exist! Maybe first run?"
+		return 0
+	fi
+
+	local _file_size_old=$(stat --format %s "${config[output_file]}" 2>/dev/null)
+	local _file_size_new=$(stat --format %s "${config[output_file_temp]}" 2>/dev/null)
+
+	if [[ -z "${_file_size_old}" || -z "${_file_size_new}" ]] ; then
+		print_verbose "Cannot check if downloaded file is newer because one required file size is not available!"
+		return 0
+	fi
+
+	if [[ "${_file_size_old}" == "${_file_size_new}" ]] ; then
+		if ! hash awk 2>/dev/null ; then
+			print_verbose "awk is not available -- cannot compare downloaded file"
+			return 0
+		fi
+
+		local _command_checksum=
+
+		if hash sha256sum 2>/dev/null ; then
+			# Use sha256sum when available
+			print_verbose "Using ‘sha256sum’ to determine if downloaded file has changed ..."
+			_command_checksum="sha256sum"
+
+		elif hash md5sum 2>/dev/null ; then
+			print_verbose "Using ‘md5sum’ to determine if downloaded file has changed ..."
+			_command_checksum="md5sum"
+		else
+			print_verbose "Cannot compare downloaded file: Neither ‘sha256sum’ nor ‘md5sum’ is available!"
+			return 0
+		fi
+
+		local _file_checksum_old=$(${_command_checksum} "${config[output_file]}" 2>/dev/null | awk '{ print $1 }')
+		local _file_checksum_new=$(${_command_checksum} "${config[output_file_temp]}" 2>/dev/null | awk '{ print $1 }')
+
+		if [[ "${_file_checksum_old}" != "${_file_checksum_new}" ]] ; then
+			print_verbose "Checksums do not match -- newly downloaded file is probably different!"
+			return 0
+		else
+			print_verbose "Checksums match -- newly downloaded file is not different!"
+			return 1
+		fi
+	else
+		print_verbose "File size is different -- newly downloaded file is probably different!"
+		return 0
+	fi
+
+	print_verbose "Was unable to determine if newly downloaded file is newer!"
+	return 0
+}
+
 do_handle_curl_errors() {
 	[[ $1 -eq 0 ]] && return 0
 
@@ -237,7 +294,10 @@ do_handle_http_status() {
 				die $EX_ERROR "$error_message"
 			fi
 
-			print_verbose "New file version downloaded"
+			if ! do_check_if_downloaded_file_is_newer ; then
+				return 0
+			fi
+
 			do_rotate_file
 			do_update_file
 			;;
