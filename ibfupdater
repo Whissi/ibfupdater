@@ -291,9 +291,7 @@ do_handle_http_status() {
 do_fetch_file() {
 	print_verbose "Fetching file from ‘${curl_args[url]}’ ..."
 	local -a args=(--disable --globoff --connect-timeout 60 --max-time 60 --retry 2
-		--fail --location --compressed
-		--proto '=http,https,ftp,ftps,file,sftp,scp'
-		--proto-redir '=http,https,ftp,ftps,sftp,scp')
+		--fail --location --compressed)
 	args+=("${CURL_EXTRA_ARGS[@]}" --user-agent "${curl_args[user_agent]}"
 		--silent --show-error --write-out '%{response_code}'
 		--dump-header "${curl_args[dump]}" --output "${curl_args[output]}"
@@ -411,8 +409,7 @@ do_setup_curl() {
 	[[ ${curl_args[url]} == *://* ]] || curl_args[url]="http://${curl_args[url]}"
 	case ${curl_args[url],,} in
 		http://*|https://*) HTTP_MODE=1 ;;
-		ftp://*|ftps://*|file://*|sftp://*|scp://*) HTTP_MODE=0 ;;
-		*) die $EX_USAGE "Unsupported URL protocol." ;;
+		*) HTTP_MODE=0 ;;
 	esac
 	[[ ${curl_args[url]} != *[$'\r\n']* ]] || die $EX_USAGE "URL must not contain line breaks."
 	curl_args[user_agent]="${config[curl_ua]:-Mozilla/5.0 (compatible; $PROGRAM_NAME/$PROGRAM_VERSION; +https://github.com/Whissi/ibfupdater/)}"

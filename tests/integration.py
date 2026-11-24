@@ -24,7 +24,7 @@ class Handler(BaseHTTPRequestHandler):
         state['requests'].append((self.path, dict(self.headers)))
         if self.path == '/redirect':
             self.send_response(302)
-            self.send_header('Location', '/file')
+            self.send_header('Location', state.get('redirect', '/file'))
             self.send_header('ETag', '"redirect-only"')
             self.end_headers()
             return
@@ -334,6 +334,38 @@ class UpdateTests(unittest.TestCase):
         source.write_bytes(b'local')
         self.run_update(url=source.as_uri())
         self.assertEqual(self.output.read_bytes(), b'local')
+
+    def test_download_uses_one_curl_call_without_protocol_options(self):
+        calls = self.root / 'curl-calls'
+        self.env['QA_CALLS'] = str(calls)
+        self.stub('curl', '''
+printf 'call\n' >> "$QA_CALLS"
+for arg in "$@"; do
+    case $arg in
+        --version|--proto|--proto-redir|--proto=*|--proto-redir=*)
+            echo 'unexpected protocol discovery or override' >&2; exit 2 ;;
+    esac
+done
+exec ''' + shlex.quote(shutil.which('curl')) + ' "$@"')
+        self.run_update(url=self.url.replace('/file', '/redirect'))
+        self.assertEqual(calls.read_text().splitlines(), ['call'])
+        self.assertEqual(self.output.read_bytes(), b'first\n')
+
+    def test_unsupported_protocol_reports_curl_error_and_preserves_output(self):
+        self.output.write_bytes(b'old')
+        _, err = self.run_update(url='ibfu-unsupported://127.0.0.1/file', code=2)
+        self.assertIn('curl:', err)
+        self.assertIn('ibfu-unsupported', err)
+        self.assertEqual(self.output.read_bytes(), b'old')
+        self.assertFalse(self.state['requests'])
+
+    def test_redirect_to_file_remains_blocked(self):
+        self.output.write_bytes(b'old')
+        source = self.root / 'source.txt'
+        source.write_bytes(b'local file')
+        self.state['redirect'] = source.as_uri()
+        self.run_update(url=self.url.replace('/file', '/redirect'), code=2)
+        self.assertEqual(self.output.read_bytes(), b'old')
 
     def test_curl_options_quotes_no_expansion_and_curlrc(self):
         self.env['SHOULD_NOT_EXPAND'] = 'expanded'

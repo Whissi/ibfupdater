@@ -17,11 +17,12 @@ file or a new filename. Symlinks, directories and other special files are
 rejected, as are filenames ending in `.`, `ibfu-meta` or `ibfu-lock`.
 
 Requirements: Bash 4.2 or newer, curl, awk with `fflush`, util-linux `flock`,
-GNU coreutils and `cmp`. `logger` is needed for `--logger`. Supported download
-schemes are HTTP, HTTPS, FTP, FTPS, SFTP, SCP and file, subject to curl's compiled
-protocol support. A URL without a scheme uses HTTP. Conditional caching is
+GNU coreutils and `cmp`. `logger` is needed for `--logger`. curl determines
+whether it supports the requested URL; unsupported protocols are reported as
+curl errors. A URL without a scheme uses HTTP. Conditional caching is
 available for HTTP/HTTPS only. URL globbing is disabled, so brackets and braces
-identify one literal URL. Redirects to local `file:` URLs are rejected.
+identify one literal URL. curl's default redirect restrictions apply;
+redirects to local `file:` URLs are rejected.
 
 ## Downloads, caching and timestamps
 
