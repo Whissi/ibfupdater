@@ -36,7 +36,6 @@
 declare -r      PROGRAM_NAME="ibfupdater" # The name of the application
 declare -r PROGRAM_SHORTNAME="ibfu"       # The short name of the application
 declare -r   PROGRAM_VERSION="0.10.0"     # The application's version number
-declare -r              OIFS="$IFS"       # Save the IFS if we need to restore
 
 # From <sysexits.h>
 declare -r     EX_OK=0   # Everything is fine. No error.
@@ -47,8 +46,11 @@ declare -r  EX_IOERR=74  # An error occurred while doing I/O on some file
 declare -r EX_CONFIG=78  # Something was found in an unconfigured or misconfigured state.
 
 declare          IS_CONFIGURED=0 # Indicates if parse_options and do_check_config were called
-declare PREV_VERSION_TO_DELETE=  # Holds the old, ‘out rotated’ log file (if any)
 declare            WAS_UPDATED=0
+declare     PUBLICATION_ACTIVE=0
+declare         PENDING_SIGNAL=0
+declare -a        BACKUP_FILES=()
+declare           BACKUP_COUNT=0
 
 
 # Default configuration
@@ -82,7 +84,7 @@ main() {
 	do_handle_curl_errors $?
 	do_handle_http_status
 
-	cleanup
+	cleanup || die $EX_IOERR "Unable to finish cleanup."
 
 	local log_message=
 	if [[ $WAS_UPDATED -eq 0 ]] ; then
@@ -100,19 +102,35 @@ main() {
 }
 
 cleanup() {
-	[[ $IS_CONFIGURED -eq 0 ]] && return 0
-
-	if [[ -n "${config[working_dir]}" && ${config[keep_working_dir]} -eq 1 ]] ; then
-		print_verbose "Keeping working directory ‘${config[working_dir]}’ ..."
-		return 0
-	elif [[ -n "${config[working_dir]}" && -d "${config[working_dir]}" ]] ; then
-		print_verbose "Removing working directory ..."
-		rm -rf "${config[working_dir]}"
-		return 0
+	if [[ -n ${config[working_dir]} ]]; then
+		if [[ ${config[keep_working_dir]} -eq 1 ]]; then
+			print_verbose "Keeping working directory ‘${config[working_dir]}’ ..."
+		else
+			print_verbose "Removing working directory ‘${config[working_dir]}’ ..."
+			rm -rf -- "${config[working_dir]}" || return 1
+		fi
+		config[working_dir]=
 	fi
+	return 0
+}
 
+on_exit() {
+	local status=$1
+	trap - EXIT
+	trap '' HUP INT QUIT ABRT TERM
+	if ! cleanup; then
+		print_error "Unable to remove working directory ‘${config[working_dir]}’."
+		[[ $status -ne 0 ]] || status=$EX_IOERR
+	fi
+	exit "$status"
+}
 
-	print_verbose "Nothing to cleanup - Working directory not set ?!"
+on_signal() {
+	if [[ $PUBLICATION_ACTIVE -eq 1 ]]; then
+		PENDING_SIGNAL=$1
+	else
+		die "$1" "Terminated!"
+	fi
 }
 
 ##
@@ -122,36 +140,20 @@ cleanup() {
 die() {
 	local status=$1
 	shift
-
-	cleanup
-
-	if [[ $IS_CONFIGURED -eq 1 ]] ; then
-		local log_message="Failed to update ‘${config[output_file]}’ from ‘${config[url]}’"
-
-		log "$log_message"
-
-		print_error ""
-		print_error "ERROR: $log_message:"
-	fi
-
-	print_error ""
-	print_error "${@}"
-
-	if [[ $IS_CONFIGURED -eq 1 ]] ; then
-		if [[ -s "${config[output_file]}" ]] ; then
-			stat_size=$(stat --format %s "${config[output_file]}")
-			stat_date=$(date --iso-8601=seconds --reference "${config[output_file]}")
-			print_error ""
-			print_error "However, ‘${config[output_file]}’ ($stat_size bytes) from ‘$stat_date’ exists (old version?)!"
-		else
-			print_error ""
-			print_error "Warning: Be warned that the file ‘${config[output_file]}’ doesn't exist/is empty!"
-			print_error "         That's OK when it's the initial download that has been failed."
+	if [[ $IS_CONFIGURED -eq 1 ]]; then
+		local message="Failed to update ‘${config[output_file]}’ from ‘${config[url]}’"
+		if [[ $WAS_UPDATED -eq 1 ]]; then
+			message="File ‘${config[output_file]}’ was updated, but finalization failed"
+			if [[ $BACKUP_COUNT -gt 0 && -d ${config[working_dir]} ]]; then
+				config[keep_working_dir]=1
+				message+="; recovery files remain in ‘${config[working_dir]}’"
+			fi
 		fi
+		log "$message: $*"
+		print_error "$message:"
 	fi
-
-
-	exit $status
+	print_error "$*"
+	exit "$status"
 }
 
 ##
@@ -198,57 +200,22 @@ do_check_config() {
 # Check if downloaded file is really newer then existing file
 # in case server doesn't provide any useful headers
 do_check_if_downloaded_file_is_newer() {
-	if [[ ! -e "${config[output_file]}" ]] ; then
-		print_verbose "Cannot check if downloaded file is newer than output file because output file does not exist! Maybe first run?"
+	if [[ ! -f ${config[output_file]} ]]; then
+		print_verbose "Output file does not exist; installing the initial download."
 		return 0
 	fi
-
-	local _file_size_old=$(stat --format %s "${config[output_file]}" 2>/dev/null)
-	local _file_size_new=$(stat --format %s "${config[output_file_temp]}" 2>/dev/null)
-
-	if [[ -z "${_file_size_old}" || -z "${_file_size_new}" ]] ; then
-		print_verbose "Cannot check if downloaded file is newer because one required file size is not available!"
-		return 0
-	fi
-
-	if [[ "${_file_size_old}" == "${_file_size_new}" ]] ; then
-		if ! hash awk 2>/dev/null ; then
-			print_verbose "awk is not available -- cannot compare downloaded file"
-			return 0
-		fi
-
-		local _command_checksum=
-
-		if hash sha256sum 2>/dev/null ; then
-			# Use sha256sum when available
-			print_verbose "Using ‘sha256sum’ to determine if downloaded file has changed ..."
-			_command_checksum="sha256sum"
-
-		elif hash md5sum 2>/dev/null ; then
-			print_verbose "Using ‘md5sum’ to determine if downloaded file has changed ..."
-			_command_checksum="md5sum"
-		else
-			print_verbose "Cannot compare downloaded file: Neither ‘sha256sum’ nor ‘md5sum’ is available!"
-			return 0
-		fi
-
-		local _file_checksum_old=$(${_command_checksum} "${config[output_file]}" 2>/dev/null | awk '{ print $1 }')
-		local _file_checksum_new=$(${_command_checksum} "${config[output_file_temp]}" 2>/dev/null | awk '{ print $1 }')
-
-		if [[ "${_file_checksum_old}" != "${_file_checksum_new}" ]] ; then
-			print_verbose "Checksums do not match -- newly downloaded file is probably different!"
-			return 0
-		else
-			print_verbose "Checksums match -- newly downloaded file is not different!"
-			return 1
-		fi
-	else
-		print_verbose "File size is different -- newly downloaded file is probably different!"
-		return 0
-	fi
-
-	print_verbose "Was unable to determine if newly downloaded file is newer!"
-	return 0
+	print_verbose "Comparing downloaded content with ‘${config[output_file]}’ ..."
+	local status=0
+	cmp --silent -- "${config[output_file]}" "${config[output_file_temp]}" || status=$?
+	case $status in
+		0)
+			print_verbose "Content is unchanged; keeping the existing file and backups."
+			return 1 ;;
+		1)
+			print_verbose "Content has changed; preparing to replace the existing file."
+			return 0 ;;
+		*) die $EX_IOERR "Unable to compare downloaded and existing files." ;;
+	esac
 }
 
 do_handle_curl_errors() {
@@ -365,77 +332,43 @@ do_fetch_file() {
 }
 
 do_rotate_file() {
-	if [[ ${config[keep]} -eq 0 ]] ; then
-		print_verbose "Not preserving any previous versions because ‘--keep’ is not set"
+	if [[ ${config[keep]} -eq 0 ]]; then
+		print_verbose "Not preserving previous versions because ‘--keep’ is not set."
+		return 0
+	elif [[ ! -f ${config[output_file]} ]]; then
+		print_verbose "No existing output file to preserve."
 		return 0
 	fi
-
-	local has_to_rotate=0
-
-	# From <http://mywiki.wooledge.org/BashFAQ/020>
-	unset files i
-	i=0
-	while IFS= read -r -u 3 -d $'\0' file; do
-		files[i++]="$file"
-	done 3< <(find "${config[output_file]}" "${config[output_file]}".[0-9]* -maxdepth 0 -print0 -type f 2>/dev/null | sort --zero-terminated -V 2>/dev/null)
-	unset i file
-	IFS="$OIFS"
-
-	unset previous_versions
-	declare -a previous_versions
-	if [[ "${#files[@]}" -gt 0 && "${files[0]}" == "${config[output_file]}" ]] ; then
-		for ((i=0; i<=${config[keep]}; i++)); do
-			if [[ -z "${files[$i]}" ]] ; then
-				# Array key does not exist (=we have less previous versions as wanted)
-				break
-			fi
-
-			case "${files[$i]}" in
-				"${config[output_file]}")
-					;&
-				"${config[output_file]}.$i")
-					previous_versions[$i]="${files[$i]}"
-					;;
-			esac
-		done
-		unset i
-	fi
-	unset files
-
-	if [[ "${#previous_versions[@]}" -gt 0 ]] ; then
-		print_verbose "Need to rotate ${#previous_versions[@]} previous versions"
-
-		for ((i=${#previous_versions[@]}; i>0; i--)); do
-			file_new="${config[output_file]}.$i"
-			file_old="${previous_versions[$[i - 1]]}"
-
-			if [[ $i -gt "${config[keep]}" ]] ; then
-				unset PREV_VERSION_TO_DELETE
-				declare -g -r PREV_VERSION_TO_DELETE="$file_new"
-			fi
-
-			print_verbose "Renaming ‘$file_old’ to ‘$file_new’ ..."
-
-			if [[ -e "$file_new" ]] ; then
-				# Destination file exists!
-				# We don't know why:
-				# - Did we create the file (e.g. user has changed (decremented) the "--keep" value)?
-				# - Is it another file/directory having just the same name?
-				# - Is it a link?
-				# We cannot decide, so stop here before we destroy something!
-				die $EX_ERROR "Couldn't rename ‘$file_old’ to ‘$file_new’ because destination file already exist!"
-			fi
-
-			mv "$file_old" "$file_new"
-			if [[ $? -ne 0 ]] ; then
-				# Not sure how this can ever happen ...
-				die $EX_IOERR "Couldn't rename file ‘$file_old’ to ‘$file_new’!"
-			fi
-		done
-		unset i file_new file_old
-	else
-		print_verbose "Nothing to rotate"
-	fi
+	print_verbose "Preparing backups; retaining up to ${config[keep]} previous versions."
+	local file suffix
+	local manifest="${config[working_dir]}/backups"
+	local ordered="${config[working_dir]}/backups.sorted"
+	: > "$manifest" || die $EX_IOERR "Unable to create backup manifest."
+	for file in "${config[output_file]}".[0-9]*; do
+		[[ -e $file || -L $file ]] || continue
+		suffix=${file#"${config[output_file]}."}
+		[[ $suffix =~ ^[1-9][0-9]*$ ]] || continue
+		is_integer "$suffix" || die $EX_CONFIG "Unsupported backup number in ‘$file’."
+		[[ -f $file && ! -L $file ]] || die $EX_IOERR "Backup ‘$file’ is not a regular file."
+		printf '%s\0' "$file" >> "$manifest" || die $EX_IOERR "Unable to write backup manifest."
+	done
+	sort -zV -- "$manifest" > "$ordered" || die $EX_IOERR "Unable to order backups."
+	BACKUP_FILES=()
+	while IFS= read -r -d '' file; do
+		BACKUP_FILES+=("$file")
+	done < "$ordered"
+	# Stage copies before publishing anything. The active name remains present.
+	BACKUP_COUNT=1
+	print_verbose "Staging current file ‘${config[output_file]}’ as backup 1 ..."
+	cp --reflink=auto --preserve=mode,ownership,timestamps -- "${config[output_file]}" \
+		"${config[working_dir]}/backup.1" || die $EX_IOERR "Unable to preserve current file."
+	for file in "${BACKUP_FILES[@]}"; do
+		(( BACKUP_COUNT < config[keep] )) || break
+		((BACKUP_COUNT++))
+		print_verbose "Staging ‘$file’ as backup $BACKUP_COUNT ..."
+		cp --reflink=auto --preserve=mode,ownership,timestamps -- "$file" \
+			"${config[working_dir]}/backup.$BACKUP_COUNT" || die $EX_IOERR "Unable to preserve ‘$file’."
+	done
 }
 
 ##
@@ -450,37 +383,27 @@ do_rotate_file() {
 #   6: File isn't writable
 do_set_output_file() {
 	[ -z "$1" ] && return 1
+	[[ ! -L $1 ]] || return 7
 
-	local filename= dirname= rpath=
+	local filename='' dirname='' rpath=''
 
 	if hash realpath 2>/dev/null ; then
 		# Use ‘realpath’ when available because it won't resolve symlinks,
 		# so the returned path is more ‘accurate’ to user's input
 		print_verbose "Using ‘realpath’ to verify output value ..."
-		rpath=$(realpath --no-symlinks --quiet "$1" 2>/dev/null)
+		rpath=$(realpath --canonicalize-missing --no-symlinks --quiet -- "$1" 2>/dev/null) || return 2
 	else
 		print_verbose "Using ‘readlink’ to verify output value ..."
-		rpath=$(readlink --canonicalize --quiet "$1" 2>/dev/null)
+		rpath=$(readlink --canonicalize --quiet -- "$1" 2>/dev/null) || return 2
 	fi
 
-	if [[ $? -ne 0 ]] ; then
-		return 2
-	fi
-
-	local pattern='^.*('"${config[meta_suffix]}"'|\.)$'
-	filename=$(basename "$rpath" 2>/dev/null)
-	if [[ $? -ne 0 ]] ; then
-		# Can ‘basename’ really fail?
-		return 1
-	elif [[ "$filename" =~ $pattern ]] ; then
+	local pattern='^.*('"${config[meta_suffix]}"'|ibfu-lock|\.)$'
+	filename=$(basename -- "$rpath" 2>/dev/null) || return 1
+	if [[ "$filename" =~ $pattern ]] ; then
 		return 3
 	fi
 
-	dirname=$(dirname "$rpath" 2>/dev/null)
-	if [[ $? -ne 0 ]] ; then
-		# Can ‘dirname’ really fail?
-		return 1
-	fi
+	dirname=$(dirname -- "$rpath" 2>/dev/null) || return 1
 
 	if [[ ! -d $dirname ]] ; then
 		return 4
@@ -494,6 +417,10 @@ do_set_output_file() {
 		return 6
 	fi
 
+	[[ ! -L $rpath && ( ! -e $rpath || -f $rpath ) ]] || return 7
+	# Resolve parent aliases so cooperating invocations share the same lock.
+	dirname=$(cd -- "$dirname" && pwd -P) || return 4
+	rpath="$dirname/$filename"
 	config[output_filename]=$filename
 	config[output_dirname]=$dirname
 	config[output_file]=$rpath
@@ -568,61 +495,75 @@ do_setup_curl() {
 }
 
 do_setup_environment() {
-	local tmp_target=$(mktemp -d -t "$PROGRAM_SHORTNAME.XXXXXXXXXX")
-	verify_working_dir "$tmp_target"
-
-	# Setting variables
-	config[working_dir]="$tmp_target"                                                                # Working directory
-	config[output_file_temp]="${config[working_dir]}/file.temp"                                      # File where we temporarly store the new version
-	config[meta_file]="${config[output_dirname]}/.${config[output_filename]}.${config[meta_suffix]}" # Full file path, where we finally store the meta data
-	config[meta_file_temp]="${config[working_dir]}/meta.new"                                         # Full file path, where we temporarly store the new meta data
-	config[meta_file_prev]="${config[working_dir]}/meta.prev"                                        # Full file path, where we temporarly store the meta data of the previous version
-
-	trap "die $? 'Terminated!'" SIGHUP SIGINT SIGQUIT SIGABRT SIGTERM
+	trap 'on_exit $?' EXIT
+	trap 'on_signal 129' HUP
+	trap 'on_signal 130' INT
+	trap 'on_signal 131' QUIT
+	trap 'on_signal 134' ABRT
+	trap 'on_signal 143' TERM
+	local command
+	for command in curl cmp flock; do
+		command -v "$command" >/dev/null 2>&1 || die $EX_ERROR "Required command ‘$command’ not found in PATH."
+	done
+	config[lock_file]="${config[output_dirname]}/.${config[output_filename]}.ibfu-lock"
+	[[ ! -L ${config[lock_file]} && ( ! -e ${config[lock_file]} || -f ${config[lock_file]} ) ]] ||
+		die $EX_IOERR "Lock path is not a regular file."
+	# Keep this inode in place: unlinking a lock file lets waiters lock an old inode.
+	exec 9>>"${config[lock_file]}" || die $EX_IOERR "Unable to open output lock."
+	print_verbose "Acquiring lock ‘${config[lock_file]}’; waiting if another update is running ..."
+	flock --exclusive 9 || die $EX_IOERR "Unable to lock output."
+	print_verbose "Output lock acquired."
+	[[ ! -L ${config[output_file]} && ( ! -e ${config[output_file]} || -f ${config[output_file]} ) ]] ||
+		die $EX_IOERR "Output is not a regular file."
+	# Same filesystem as the destination, so publication uses an atomic rename.
+	config[working_dir]=$(mktemp -d -- "${config[output_dirname]}/.ibfu.XXXXXXXXXX") ||
+		die $EX_IOERR "Unable to create working directory."
+	[[ -d ${config[working_dir]} ]] || die $EX_IOERR "Working directory does not exist."
+	config[output_file_temp]="${config[working_dir]}/file.temp"
+	config[meta_file]="${config[output_dirname]}/.${config[output_filename]}.${config[meta_suffix]}"
+	config[meta_file_temp]="${config[working_dir]}/meta.new"
+	config[meta_file_prev]="${config[working_dir]}/meta.prev"
+	[[ ! -L ${config[meta_file]} && ( ! -e ${config[meta_file]} || -f ${config[meta_file]} ) ]] ||
+		die $EX_IOERR "Metadata is not a regular file."
+	print_verbose "Working directory is ‘${config[working_dir]}’"
 }
 
 do_update_file() {
-		if [[ ${config[keep]} -eq 0 ]] ; then
-			mv --force "${config[output_file_temp]}" "${config[output_file]}"
-		else
-			# No forced move when ‘--keep’ was set because the previous
-			# existing version with the same name should be already rotated!
-			# If not, that's an additional error check.
-			mv "${config[output_file_temp]}" "${config[output_file]}"
+	if [[ -f ${config[output_file]} ]]; then
+		print_verbose "Preserving ownership and permissions of ‘${config[output_file]}’ ..."
+		chown --reference="${config[output_file]}" -- "${config[output_file_temp]}" ||
+			die $EX_IOERR "Unable to preserve output ownership."
+		chmod --reference="${config[output_file]}" -- "${config[output_file_temp]}" ||
+			die $EX_IOERR "Unable to preserve output permissions."
+	fi
+	# Invalidate old validators before publishing new data. A failure between
+	# the two renames must cause an unconditional download on the next run.
+	[[ ! -e ${config[meta_file]} ]] || print_verbose "Invalidating old metadata ‘${config[meta_file]}’ before publication ..."
+	rm -f -- "${config[meta_file]}" || die $EX_IOERR "Unable to invalidate old metadata."
+	local status=0 i file suffix
+	print_verbose "Publishing downloaded file as ‘${config[output_file]}’ ..."
+	PUBLICATION_ACTIVE=1
+	mv -fT -- "${config[output_file_temp]}" "${config[output_file]}" || status=$?
+	[[ $status -ne 0 ]] || WAS_UPDATED=1
+	PUBLICATION_ACTIVE=0
+	[[ $PENDING_SIGNAL -eq 0 ]] || die "$PENDING_SIGNAL" "Terminated!"
+	[[ $status -eq 0 ]] || die $EX_IOERR "Unable to install downloaded file."
+	print_verbose "New version successfully installed in ‘${config[output_file]}’."
+	for ((i=1; i<=BACKUP_COUNT; i++)); do
+		print_verbose "Installing backup ‘${config[output_file]}.$i’ ..."
+		mv -fT -- "${config[working_dir]}/backup.$i" "${config[output_file]}.$i" ||
+			die $EX_IOERR "Unable to install backup $i."
+	done
+	for file in "${BACKUP_FILES[@]}"; do
+		suffix=${file#"${config[output_file]}."}
+		if (( suffix > BACKUP_COUNT )); then
+			print_verbose "Removing expired backup ‘$file’ ..."
+			rm -- "$file" || die $EX_IOERR "Unable to remove expired backup ‘$file’."
 		fi
-
-		if [[ $? -eq 0 ]] ; then
-			print_verbose "New version successfully installed in ‘${config[output_file]}’"
-		else
-			die $EX_IOERR "Couldn't install new version of ‘${config[output_file]}’"
-		fi
-
-		if [[ ${config[meta_enabled]} -eq 1 ]] ; then
-			mv --force "${config[meta_file_temp]}" "${config[meta_file]}"
-			if [[ $? -eq 0 ]] ; then
-				print_verbose "Meta data file successfully installed in ‘${config[meta_file]}’"
-			else
-				die $EX_IOERR "Couldn't install meta data file to ‘${config[meta_file]}’"
-			fi
-		elif [[ -e "${config[meta_file]}" ]] ; then
-			rm "${config[meta_file]}"
-			if [[ $? -eq 0 ]] ; then
-				print_verbose "Old meta data file removed because option ‘--enable-caching’ was not set"
-			else
-				die $EX_IOERR "Couldn't remove old meta data file ‘${config[meta_file]}’"
-			fi
-		fi
-
-		if [[ -n "$PREV_VERSION_TO_DELETE" ]] ; then
-			rm "$PREV_VERSION_TO_DELETE"
-			if [[ $? -eq 0 ]] ; then
-				print_verbose "Old, now ‘out rotated’ previous version ‘$PREV_VERSION_TO_DELETE’ removed"
-			else
-				die $EX_IOERR "Couldn't remove old, now ‘out rotated’ previous version ‘$PREV_VERSION_TO_DELETE’"
-			fi
-		fi
-
-		WAS_UPDATED=1
+	done
+	if [[ ${config[meta_enabled]} -eq 1 ]]; then
+		mv -fT -- "${config[meta_file_temp]}" "${config[meta_file]}" || die $EX_IOERR "Unable to install metadata."
+	fi
 }
 
 has_unsupported_curl_option() {
@@ -639,15 +580,8 @@ has_unsupported_curl_option() {
 }
 
 is_integer() {
-	[[ -z "$1" ]] && return 1
-
-	local pattern='^[1-9]{1}[[:digit:]]*$'
-	if [[ "$1" =~ $pattern ]] ; then
-		return 0
-	fi
-
-
-	return 1
+	[[ $1 =~ ^[1-9][0-9]*$ && ${#1} -le 10 ]] || return 1
+	(( $1 <= 2147483647 ))
 }
 
 log() {
@@ -658,11 +592,12 @@ log() {
 # Usage: parse_options args
 #        args: Arguments
 parse_options() {
-	local has_error=0 has_url=0
+	local has_url=0
 
 	IS_CONFIGURED=0 # Make sure that do_check_config() will be called
 
-	while [ "$1" ]; do
+	while (( $# )); do
+		[[ -n $1 ]] || die $EX_USAGE "Empty argument is not supported."
 		case "$1" in
 			--curl-options)
 				die_if_missing_arg "$1" "$2"
@@ -708,7 +643,7 @@ parse_options() {
 				else
 					print_error ""
 					print_error "ERROR: Invalid ‘keep’ value ‘$1’ given!"
-					print_error "The value must be an integer."
+					print_error "The value must be an integer between 1 and 2147483647."
 					exit $EX_USAGE;
 				fi
 				;;
@@ -743,6 +678,9 @@ parse_options() {
 							;;
 						5)
 							print_error "Output directory isn't writable."
+							;;
+						7)
+							print_error "Output must be a regular file, not a symlink or directory."
 							;;
 						6)
 							print_error "Output file isn't writeable."
@@ -799,7 +737,7 @@ parse_options() {
 ##
 # Prints an error message to stderr.
 print_error() {
-	echo >&2 -e "$@"
+	printf '%s\n' "$@" >&2
 }
 
 print_program_header() {
@@ -899,25 +837,12 @@ print_usage() {
 print_verbose() {
 	[[ ${config[verbose]} -ne 1 ]] && return
 
-	echo >&1 -e "$@"
+	printf '%s\n' "$@"
 }
 
 print_version() {
 	echo "$PROGRAM_NAME v$PROGRAM_VERSION"
 }
 
-##
-# Usage: verify_working_dir <path>
-verify_working_dir() {
-	if [[ ! $1 ]] ; then
-		die 1 'ERROR: Temporary file path is unset!'
-	elif [[ -d $1 ]] ; then
-		cd "$1"
-	else
-		die $EX_IOERR "ERROR: Unable to create/change into working directory ‘$1’!"
-	fi
-
-	print_verbose "Working directory is set to ‘$PWD’"
-}
 
 main "$@"
