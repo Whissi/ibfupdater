@@ -35,7 +35,7 @@
 # Read-only variables:
 declare -r      PROGRAM_NAME="ibfupdater" # The name of the application
 declare -r PROGRAM_SHORTNAME="ibfu"       # The short name of the application
-declare -r   PROGRAM_VERSION="0.10.0"     # The application's version number
+declare -r   PROGRAM_VERSION="1.0.0"      # The application's version number
 
 # From <sysexits.h>
 declare -r     EX_OK=0   # Everything is fine. No error.
