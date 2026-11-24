@@ -51,6 +51,16 @@ declare     PUBLICATION_ACTIVE=0
 declare         PENDING_SIGNAL=0
 declare -a        BACKUP_FILES=()
 declare           BACKUP_COUNT=0
+declare -a    CURL_EXTRA_ARGS=()
+declare -A          curl_args=()
+declare       CACHE_CONDITION=0
+declare           REQUEST_KEY=''
+declare         RESPONSE_ETAG=''
+declare         RESPONSE_TIME=''
+declare           CACHED_ETAG=''
+declare           CACHED_TIME=''
+declare      CACHED_SIGNATURE=''
+declare             HTTP_MODE=0
 
 
 # Default configuration
@@ -241,94 +251,60 @@ do_handle_curl_errors() {
 }
 
 do_handle_http_status() {
-	local http_status_code=$(cat "${curl_args[log_output]}")
-
-	if [[ ${#http_status_code} -gt 3 ]] ; then
-		http_status_code=-1
-		print_verbose "Something went wrong: HTTP status code length was >3 - changed"
-	fi
-
-	case "$http_status_code" in
-		200)
-			if [[ ! -e "${config[output_file_temp]}" ]] ; then
-				local error_message=
-
-				error_message="Something went wrong. The file wasn't properly downloaded!"
-				if [[ -n ${config[curl_options]} ]] ; then
-					error_message="Something went wrong. The file wasn't properly downloaded! Check parameters, especially ‘--curl-options’!"
-				fi
-
-				die $EX_ERROR "$error_message"
-			fi
-
-			if ! do_check_if_downloaded_file_is_newer ; then
+	local status
+	status=$(cat -- "${curl_args[log_output]}") || die $EX_IOERR "Unable to read transfer status."
+	[[ $status =~ ^[0-9]{3}$ ]] || die $EX_CURL "Invalid transfer status ‘$status’."
+	if [[ $HTTP_MODE -eq 1 ]]; then
+		print_verbose "Server returned HTTP status $status."
+		case $status in
+			200) ;;
+			304)
+				[[ $CACHE_CONDITION -eq 1 && -f ${config[output_file]} ]] ||
+					die $EX_CURL "Received HTTP 304 without a usable cached file."
+				do_read_response_headers
+				# A 304 need not repeat either validator.
+				[[ $(stat --format='%d:%i:%s:%y:%z' -- "${config[output_file]}") == "$CACHED_SIGNATURE" ]] ||
+					die $EX_IOERR "Cached file changed during validation."
+				RESPONSE_ETAG=${RESPONSE_ETAG:-$CACHED_ETAG}
+				RESPONSE_TIME=${RESPONSE_TIME:-$CACHED_TIME}
+				do_save_metadata
+				print_verbose "Server confirmed the cached file is up to date; keeping the existing file and backups."
 				return 0
-			fi
-
-			do_rotate_file
-			do_update_file
-			;;
-
-		304)
-			print_verbose "No new file version found - file is already up to date"
-			;;
-		-1)
-			if [[ -s "${curl_args[log_error]}" ]] ; then
-				die $EX_CURL "$(cat "${curl_args[log_error]}")"
-			else
-				die $EX_ERROR "Something went wrong. Couldn't determine HTTP status code. Check parameter quoting, especially for ‘--curl-options’ if set!"
-			fi
-			;;
-
-		*)
-			die $EX_ERROR "Unsupported HTTP status code ‘$http_status_code’ was returned!"
-			;;
-	esac
+				;;
+			*) die $EX_CURL "Unsupported HTTP status code ‘$status’." ;;
+		esac
+		do_read_response_headers
+	elif [[ $status != 000 && $status != 2?? ]]; then
+		die $EX_CURL "Unexpected transfer status ‘$status’."
+	else
+		print_verbose "Non-HTTP transfer completed with status $status."
+	fi
+	[[ -f ${config[output_file_temp]} ]] || die $EX_CURL "Download did not produce a regular file."
+	if do_check_if_downloaded_file_is_newer; then
+		do_rotate_file
+		do_update_file
+	fi
+	# Even identical response bodies can carry new validators.
+	do_save_metadata
 }
 
 do_fetch_file() {
-	unset curl_status
 	print_verbose "Fetching file from ‘${curl_args[url]}’ ..."
-
-	if [[ ${config[debug]} -eq 1 && -n ${config[curl_options]} ]] ; then
-		# Disabling debugging because an invalid/unquoted cURL option could
-		# result in outputing shell code we don't want to execute!
-		set +x
-		print_verbose "Debug mode temporarily turned off to prevent cURL from executing arbitrary shell code"
-	fi
-
-	curl \
-		--user-agent "${curl_args[user_agent]}" \
-		--connect-timeout 60 \
-		--max-time 60 \
-		--retry 2 \
-		--fail \
-		--location \
-		--compressed \
-		${curl_args[remote_time]:+${curl_args[remote_time]} }\
-		${config[curl_options]:+${config[curl_options]} }\
-		--silent \
-		--show-error \
-		--stderr "${curl_args[log_error]}" \
-		--write-out %{http_code} \
-		${curl_args[dump]:+--dump-header "${curl_args[dump]}" }\
-		${curl_args[etag]:+--header 'If-None-Match: "'"${curl_args[etag]}"'"' }\
-		${curl_args[last_modified]:+--time-cond "'${curl_args[last_modified]}'" }\
-		--output "${curl_args[output]}" \
-		--url "${curl_args[url]}" \
-		1>"${curl_args[log_output]}" \
-		2>"${curl_args[log_error]}"
-
-	if [[ -n ${config[curl_options]} && ${config[debug]} -eq 1 ]] ; then
-		# Reactivating debug mode
-		set -x
-		print_verbose "Debug mode reactivated"
-	fi
-
-	curl_status=$?
-
-
-	return $curl_status
+	local -a args=(--disable --globoff --connect-timeout 60 --max-time 60 --retry 2
+		--fail --location --compressed
+		--proto '=http,https,ftp,ftps,file,sftp,scp'
+		--proto-redir '=http,https,ftp,ftps,sftp,scp')
+	args+=("${CURL_EXTRA_ARGS[@]}" --user-agent "${curl_args[user_agent]}"
+		--silent --show-error --write-out '%{response_code}'
+		--dump-header "${curl_args[dump]}" --output "${curl_args[output]}"
+		--url "${curl_args[url]}")
+	[[ ${config[remote-time_enabled]} -eq 0 ]] || args+=(--remote-time)
+	[[ -z ${curl_args[etag]} ]] || args+=(--header "If-None-Match: ${curl_args[etag]}")
+	[[ -z ${curl_args[last_modified]} ]] || args+=(--time-cond "${curl_args[last_modified]}")
+	local status=0
+	curl "${args[@]}" >"${curl_args[log_output]}" 2>"${curl_args[log_error]}" || status=$?
+	print_verbose "cURL finished with exit status $status."
+	return "$status"
 }
 
 do_rotate_file() {
@@ -430,68 +406,83 @@ do_set_output_file() {
 }
 
 do_setup_curl() {
-	unset curl_args
-	declare -g -A curl_args
-	curl_args[output]="${config[output_file_temp]}"
-	curl_args[url]="${config[url]}"
+	curl_args[output]=${config[output_file_temp]}
+	curl_args[url]=${config[url]// /%20}
+	[[ ${curl_args[url]} == *://* ]] || curl_args[url]="http://${curl_args[url]}"
+	case ${curl_args[url],,} in
+		http://*|https://*) HTTP_MODE=1 ;;
+		ftp://*|ftps://*|file://*|sftp://*|scp://*) HTTP_MODE=0 ;;
+		*) die $EX_USAGE "Unsupported URL protocol." ;;
+	esac
+	[[ ${curl_args[url]} != *[$'\r\n']* ]] || die $EX_USAGE "URL must not contain line breaks."
 	curl_args[user_agent]="${config[curl_ua]:-Mozilla/5.0 (compatible; $PROGRAM_NAME/$PROGRAM_VERSION; +https://github.com/Whissi/ibfupdater/)}"
-	curl_args[dump]="${config[meta_file_temp]}"
-	curl_args[etag]=
-	curl_args[remote_time]="--remote-time"
-	curl_args[last_modified]=
+	curl_args[dump]="${config[working_dir]}/headers"
+	curl_args[etag]=''
+	curl_args[last_modified]=''
 	curl_args[log_output]="${config[working_dir]}/curl_output.log"
 	curl_args[log_error]="${config[working_dir]}/curl_error.log"
-
-	# Make URL safe for use
-	curl_args[url]=${curl_args[url]// /%20} # cURL doesn't handle whitespaces like wget on its own
-
-	# Cache support
-	if [[ ${config[force]} -eq 1 ]] ; then
-		print_verbose "Skipping cache due to ‘--force’ option"
-	elif [[ ${config[meta_enabled]} -eq 0 ]] ; then
-		print_verbose "Skipping cache because option ‘--enable-caching’ was not set"
-	elif [[ ! -e "${config[meta_file]}" ]] ; then
-		print_verbose "Skipping cache because no meta data found"
-	elif [[ ! -e "${config[output_file]}" ]] ; then
-		print_verbose "Skipping cache because output file doesn't exist (first run?)"
-
-		rm -f "${config[meta_file]}"
-		[[ $? -ne 0 ]] && die $EX_IOERR "ERROR: Couldn't remove orphaned meta data file ‘${config[meta_file]}’"
-
-		print_verbose "Orphan meta data file removed"
+	if [[ ${config[remote-time_enabled]} -eq 1 ]]; then
+		print_verbose "Using the remote timestamp for downloaded files when available."
 	else
-		local has_useable_cache_header=0 etag= last_modified=
-
-		cat "${config[meta_file]}" | tr -d '\r' > "${config[meta_file_prev]}"
-
-		if [[ ${config[etag_enabled]} -eq 1 ]] ; then
-			etag=$(sed -rn 's/^etag: "(.*)"/\1/ip' "${config[meta_file_prev]}")
-		else
-			print_verbose "Skipping ETag due to ‘--disable-etag’ option"
-		fi
-
-		if [[ -n "$etag" ]] ; then
-			has_useable_cache_header=1
-			curl_args[etag]="$etag"
-			print_verbose "Will use ‘ETag’ value ‘$etag’ for cache validation"
-		else
-			# Last-modified fallback
-			last_modified=$(sed -rn 's/^last-modified: (.*)/\1/ip' "${config[meta_file_prev]}")
-			if [[ -n "$last_modified" ]] ; then
-				has_useable_cache_header=1
-				curl_args[last_modified]="$last_modified"
-				print_verbose "Will use ‘Last-modified’ value ‘$last_modified’ for cache validation"
-			fi
-		fi
-
-		[[ $has_useable_cache_header -eq 0 ]] && print_verbose "Skipping cache because no suitable method was found"
+		print_verbose "Using download time due to ‘--disable-remote-time’."
 	fi
-
-	# Remote time support
-	if [[ ${config[remote-time_enabled]} -eq 0 ]]; then
-		curl_args[remote_time]=
-		print_verbose "Won't set the downloaded file's timestamp to match the one on the remote server due to ‘--disable-remote-time’ option"
+	# Cache validators belong to a request and a particular local file.
+	# Hash the request description so credentials are not stored in metadata.
+	REQUEST_KEY=$(set -o pipefail; printf '%s\0' "${curl_args[url]}" "${curl_args[user_agent]}" \
+		"${CURL_EXTRA_ARGS[@]}" | sha256sum) || die $EX_IOERR "Unable to identify request."
+	REQUEST_KEY=${REQUEST_KEY%% *}
+	if [[ $HTTP_MODE -eq 0 ]]; then
+		print_verbose "Skipping cache validation for a non-HTTP URL."
+		return 0
+	elif [[ ${config[force]} -eq 1 ]]; then
+		print_verbose "Skipping cache validation due to ‘--force’."
+		return 0
+	elif [[ ${config[meta_enabled]} -eq 0 ]]; then
+		print_verbose "Skipping cache validation because ‘--enable-caching’ is not set."
+		return 0
+	elif [[ ! -f ${config[meta_file]} ]]; then
+		print_verbose "Skipping cache validation because no metadata file exists."
+		return 0
+	elif [[ ! -f ${config[output_file]} ]]; then
+		print_verbose "Skipping cache validation because the output file is missing."
+		return 0
 	fi
+	local -a metadata=()
+	local signature
+	mapfile -t metadata < "${config[meta_file]}" || die $EX_IOERR "Unable to read metadata."
+	# Legacy raw header dumps are refreshed through an unconditional download.
+	if [[ ${#metadata[@]} -ne 5 || ${metadata[0]} != 'IBFU-META 1' ]]; then
+		print_verbose "Skipping cache validation because metadata is legacy or invalid."
+		return 0
+	elif [[ ${metadata[1]} != "$REQUEST_KEY" ]]; then
+		print_verbose "Skipping cache validation because the URL or request options have changed."
+		return 0
+	fi
+	signature=$(stat --format='%d:%i:%s:%y:%z' -- "${config[output_file]}") || die $EX_IOERR "Unable to inspect output."
+	if [[ ${metadata[4]} != "$signature" ]]; then
+		print_verbose "Skipping cache validation because the local file has changed."
+		return 0
+	fi
+	CACHED_SIGNATURE=$signature
+	is_etag "${metadata[2]}" && CACHED_ETAG=${metadata[2]}
+	if [[ -n ${metadata[3]} ]] && LC_ALL=C date -d "${metadata[3]}" >/dev/null 2>&1; then
+		CACHED_TIME=${metadata[3]}
+	fi
+	if [[ ${config[etag_enabled]} -eq 0 ]]; then
+		print_verbose "Skipping ETag due to ‘--disable-etag’; checking Last-Modified."
+	fi
+	if [[ ${config[etag_enabled]} -eq 1 ]] && is_etag "${metadata[2]}"; then
+		curl_args[etag]=${metadata[2]}
+		CACHE_CONDITION=1
+		print_verbose "Using ETag ‘${curl_args[etag]}’ for cache validation."
+	elif [[ -n ${metadata[3]} ]] && LC_ALL=C date -d "${metadata[3]}" >/dev/null 2>&1; then
+		curl_args[last_modified]=${metadata[3]}
+		CACHE_CONDITION=1
+		print_verbose "Using Last-Modified ‘${curl_args[last_modified]}’ for cache validation."
+	else
+		print_verbose "Skipping cache validation because no usable validator is available."
+	fi
+	return 0
 }
 
 do_setup_environment() {
@@ -502,7 +493,7 @@ do_setup_environment() {
 	trap 'on_signal 134' ABRT
 	trap 'on_signal 143' TERM
 	local command
-	for command in curl cmp flock; do
+	for command in curl cmp flock awk sha256sum; do
 		command -v "$command" >/dev/null 2>&1 || die $EX_ERROR "Required command ‘$command’ not found in PATH."
 	done
 	config[lock_file]="${config[output_dirname]}/.${config[output_filename]}.ibfu-lock"
@@ -522,7 +513,6 @@ do_setup_environment() {
 	config[output_file_temp]="${config[working_dir]}/file.temp"
 	config[meta_file]="${config[output_dirname]}/.${config[output_filename]}.${config[meta_suffix]}"
 	config[meta_file_temp]="${config[working_dir]}/meta.new"
-	config[meta_file_prev]="${config[working_dir]}/meta.prev"
 	[[ ! -L ${config[meta_file]} && ( ! -e ${config[meta_file]} || -f ${config[meta_file]} ) ]] ||
 		die $EX_IOERR "Metadata is not a regular file."
 	print_verbose "Working directory is ‘${config[working_dir]}’"
@@ -561,22 +551,119 @@ do_update_file() {
 			rm -- "$file" || die $EX_IOERR "Unable to remove expired backup ‘$file’."
 		fi
 	done
-	if [[ ${config[meta_enabled]} -eq 1 ]]; then
-		mv -fT -- "${config[meta_file_temp]}" "${config[meta_file]}" || die $EX_IOERR "Unable to install metadata."
+}
+
+is_etag() {
+	local pattern='^(W/)?"[^"[:cntrl:]]*"$'
+	[[ $1 =~ $pattern ]]
+}
+
+do_read_response_headers() {
+	local parsed="${config[working_dir]}/validators"
+	# curl dumps every response (proxy, informational, redirect and final).
+	# Reset at each status line and accept fields only inside its header block.
+	LC_ALL=C awk '
+		/^HTTP\/[0-9.]+ [0-9][0-9][0-9]/ { etag = ""; modified = ""; headers = 1; next }
+		{ sub(/\r$/, "") }
+		/^$/ { headers = 0; next }
+		headers {
+			key = tolower($0)
+			value = $0
+			sub(/^[^:]*:[ \t]*/, "", value)
+			sub(/[ \t]+$/, "", value)
+			if (key ~ /^etag:/) etag = value
+			if (key ~ /^last-modified:/) modified = value
+		}
+		END { printf "%s\n%s\n", etag, modified; if (fflush() != 0) exit 74 }
+	' < "${curl_args[dump]}" > "$parsed" || die $EX_IOERR "Unable to parse response headers."
+	local -a values=()
+	mapfile -t values < "$parsed" || die $EX_IOERR "Unable to read response validators."
+	RESPONSE_ETAG=${values[0]}
+	RESPONSE_TIME=${values[1]}
+	is_etag "$RESPONSE_ETAG" || RESPONSE_ETAG=''
+	if [[ -n $RESPONSE_TIME ]] && ! LC_ALL=C date -d "$RESPONSE_TIME" >/dev/null 2>&1; then
+		RESPONSE_TIME=''
 	fi
 }
 
-has_unsupported_curl_option() {
-	[[ -z "$1" ]] && return 1
-
-	# The following options are known to break this script
-	local pattern='^([ ]?(-C|--continue-at|-J|--remote-header-name|-o.*|--output|--remote-name-all|-T|--upload-file|-V|--version|-M|--manual|-h|--help|-A|--user-agent))+( .*)?$'
-	if [[ "$1" =~ $pattern ]] ; then
+do_save_metadata() {
+	if [[ ${config[meta_enabled]} -eq 0 || $HTTP_MODE -eq 0 ]]; then
+		[[ ! -e ${config[meta_file]} ]] || print_verbose "Removing obsolete metadata ‘${config[meta_file]}’; HTTP caching is not enabled."
+		rm -f -- "${config[meta_file]}" || die $EX_IOERR "Unable to remove obsolete metadata."
 		return 0
 	fi
+	print_verbose "Saving cache metadata to ‘${config[meta_file]}’ ..."
+	local signature
+	signature=$(stat --format='%d:%i:%s:%y:%z' -- "${config[output_file]}") || die $EX_IOERR "Unable to inspect output."
+	printf '%s\n' 'IBFU-META 1' "$REQUEST_KEY" "$RESPONSE_ETAG" "$RESPONSE_TIME" "$signature" \
+		> "${config[meta_file_temp]}" || die $EX_IOERR "Unable to write metadata."
+	chmod 600 -- "${config[meta_file_temp]}" || die $EX_IOERR "Unable to protect metadata."
+	mv -fT -- "${config[meta_file_temp]}" "${config[meta_file]}" || die $EX_IOERR "Unable to install metadata."
+	print_verbose "Cache metadata successfully updated."
+	return 0
+}
 
-
-	return 1
+parse_curl_options() {
+	# Tokenize quotes and backslash escapes without evaluating shell code or
+	# expanding variables, command substitutions or filename wildcards.
+	local input=$1 word='' quote='' char escaped=0 started=0 i
+	local -a words=()
+	for ((i=0; i<${#input}; i++)); do
+		char=${input:i:1}
+		if [[ $escaped -eq 1 ]]; then
+			word+=$char; escaped=0
+		elif [[ $quote == "'" ]]; then
+			if [[ $char == "'" ]]; then quote=''; else word+=$char; fi
+		elif [[ $char == \\ ]]; then
+			escaped=1; started=1
+		elif [[ -n $quote ]]; then
+			if [[ $char == "$quote" ]]; then quote=''; else word+=$char; fi
+		elif [[ $char == '"' || $char == "'" ]]; then
+			quote=$char; started=1
+		elif [[ $char == [$' \t\r\n'] ]]; then
+			if [[ $started -eq 1 ]]; then words+=("$word"); word=''; started=0; fi
+		else
+			word+=$char; started=1
+		fi
+	done
+	[[ -z $quote && $escaped -eq 0 ]] || die $EX_USAGE "Unclosed quote or escape in --curl-options."
+	[[ $started -eq 0 ]] || words+=("$word")
+	CURL_EXTRA_ARGS=()
+	local option value inline
+	for ((i=0; i<${#words[@]}; i++)); do
+		option=${words[i]}; value=''; inline=0
+		if [[ $option == --*=* ]]; then
+			value=${option#*=}; option=${option%%=*}; inline=1
+		fi
+		# Explicitly allow download controls. curl abbreviations, combined
+		# short options, config files and additional transfers are unsupported.
+		case $option in
+			-4|-6|--ipv4|--ipv6|-k|--insecure|--http1.0|--http1.1|--http2|--http3|\
+			--basic|--digest|--anyauth|--negotiate|--ntlm|-n|--netrc|--netrc-optional|\
+			--proxy-basic|--proxy-digest|--proxy-anyauth|--retry-connrefused)
+				[[ $inline -eq 0 ]] || die $EX_USAGE "Option ‘$option’ does not take a value."
+				CURL_EXTRA_ARGS+=("$option")
+				continue ;;
+			-u|--user|-U|--proxy-user|-x|--proxy|--noproxy|--cacert|--capath|\
+			--cert|--key|--pass|--netrc-file|-b|--cookie|-H|--header|--referer|\
+			--connect-timeout|-m|--max-time|--retry|--retry-delay|--retry-max-time|\
+			--max-redirs|--max-filesize|--limit-rate|--speed-limit|--speed-time|\
+			--interface|--resolve|--connect-to|--tls-max)
+				if [[ $inline -eq 0 ]]; then
+					((i++))
+					(( i < ${#words[@]} )) || die $EX_USAGE "Missing value for cURL option ‘$option’."
+					value=${words[i]}
+				fi ;;
+			*) die $EX_USAGE "Unsupported cURL option ‘$option’; see README.md for supported options." ;;
+		esac
+		if [[ $option == -H || $option == --header ]]; then
+			case ${value,,} in
+				@*|if-none-match:*|if-modified-since:*|range:*|*[$'\r\n']*)
+					die $EX_USAGE "Conditional, range and file-based headers are managed by ibfupdater." ;;
+			esac
+		fi
+		CURL_EXTRA_ARGS+=("$option" "$value")
+	done
 }
 
 is_integer() {
@@ -602,16 +689,9 @@ parse_options() {
 			--curl-options)
 				die_if_missing_arg "$1" "$2"
 				shift
-				if has_unsupported_curl_option "$1"; then
-					print_error ""
-					print_error "ERROR: Not supported cURL option(s) detected."
-					print_error ""
-					print_error "See ‘$PROGRAM_NAME --help’ for a list of unsupported options."
-					exit $EX_USAGE;
-				else
-					config[curl_options]="$1"
-					shift
-				fi
+				config[curl_options]="$1"
+				parse_curl_options "$1"
+				shift
 				;;
 			--debug)
 				shift
@@ -671,7 +751,7 @@ parse_options() {
 							print_error "Is the file accessible? Check file permission."
 							;;
 						3)
-							print_error "The filename must not end with ‘.’ or ‘${config[meta_suffix]}’."
+							print_error "The filename must not end with ‘.’, ‘${config[meta_suffix]}’ or ‘ibfu-lock’."
 							;;
 						4)
 							print_error "Output directory doesn't exist."
@@ -756,12 +836,14 @@ print_usage() {
 	echo "	If you want to pass additional cURL options to the $PROGRAM_NAME,"
 	echo "	use this option."
 	echo ""
-	echo "	The following options are known to break the script and therefore are unsupported:"
+	echo "	Only the download options listed in README.md are supported. The following examples are unsupported:"
 	echo ""
 	echo "	    * -C, --continue-at"
 	echo "	    * -J, --remote-header-name"
 	echo "	    * -o, --output"
-	echo "	    * --remote-name-all"
+	echo "	    * -O, --remote-name, --remote-name-all"
+	echo "	    * -K, --config, --url, --next"
+	echo "	    * -I, --head, -r, --range"
 	echo "	    * -T, --upload-file"
 	echo "	    * -A, --user-agent"
 	echo "	    * -V, --version"
@@ -774,11 +856,17 @@ print_usage() {
 	echo "	    This will fetch the given URL using the given credentials."
 	echo ""
 	echo "	Note:"
-	echo "	    If any addidional cURL option value contains special characters, use single quotes like"
-	echo "	    in the example or don't forget to escape!"
+	echo "	    Pass the options as one string. Single and double quotes inside that string group arguments."
+	echo "	    Outside single quotes, a backslash escapes the next character. There is no shell expansion."
+	echo "	    For a value containing spaces, for example, use --curl-options '--user \"myuser1:my secret\"'."
+	echo "	    Long options accept --option=value or --option value; short options need a separate value."
+	echo "	    Abbreviations and combined short options are not supported. Repeating this option replaces the list."
+	echo "	    Conditional and Range headers, header files and multiline header values are not supported."
+	echo "	    The default .curlrc is ignored so it cannot add transfers or change the output destination."
 	echo ""
 	echo "--debug"
 	echo "	This option enables the debug mode. Should be the first option for best results."
+	echo "	Bash tracing can expose URLs and credentials in the output."
 	echo ""
 	echo "--disable-etag"
 	echo "	This option disables the usage of the ‘ETag’ cache validation method. In general, ETag should be"
@@ -786,43 +874,55 @@ print_usage() {
 	echo "	In that case, the ‘Last-modified’ header is your only option (when supported by the server)."
 	echo ""
 	echo "--disable-remote-time"
-	echo "	By default, when a file is downloaded, it's timestamps are set to match those from the remote file."
+	echo "	By default, when a file is downloaded, its timestamp is set to match the one from the remote file."
 	echo "	However, it is sometimes useful to base the local file's timestamp on when it was actually downloaded;"
 	echo "	for that purpose, the ‘--disable-remote-time’ option has been provided."
+	echo "	When the downloaded content is unchanged, the existing file and its timestamp are retained."
 	echo ""
 	echo "--enable-caching"
 	echo "	This option enables the intelligent update mechanism. When this option is set,"
-	echo "	the application will download the file only if really needed. Therefore, we need"
-	echo "	to save meta data next to the file (‘.<file>.${config[meta_suffix]}’)."
+	echo "	the application uses ETag or Last-Modified validation when the HTTP(S) server supports it."
+	echo "	This can avoid downloading unchanged content. Meta data is saved next to the file"
+	echo "	(‘.<file>.${config[meta_suffix]}’) and associated with the request and the local file."
+	echo "	Missing, outdated or incompatible meta data causes an unconditional download."
 	echo ""
 	echo "--force"
-	echo "	Forces an update, even when the server says you already have the latest version."
+	echo "	Forces a download without conditional cache validation, even when a cached version exists."
+	echo "	Identical content still leaves the current file and its backups unchanged."
 	echo ""
 	echo "--keep <num>"
-	echo "	Sets the number of previous downloaded versions you want to keep. When a new version"
-	echo "	was downloaded, the previous downloaded file wil be renamed to ‘<file>.1’."
+	echo "	Sets the number of previous, different versions you want to keep (1 to 2147483647)."
+	echo "	When changed content is installed, the previous file is preserved as ‘<file>.1’."
+	echo "	Older versions follow as ‘<file>.2’, etc. Gaps are compacted and excess versions removed."
+	echo "	Unchanged content does not rotate backups. Without this option, existing backups are left alone."
 	echo ""
 	echo "--keep-working-dir"
 	echo "	When set, $PROGRAM_NAME won't remove the working directory at the end."
-	echo "	Useful for debugging."
+	echo "	Useful for debugging. The private working directory is created inside the output directory."
 	echo ""
 	echo "--logger"
-	echo "	Enables the usage of ‘logger’. Will only log summaries about what happened (successful"
-	echo "	or unsuccessful file updates), no error messages."
+	echo "	Enables the usage of ‘logger’. Logs summaries of successful or unsuccessful file updates"
+	echo "	to syslog, including the actual error details when an update fails."
 	echo ""
 	echo "--quiet"
-	echo "	No output. Useful for cron jobs."
+	echo "	Suppresses normal output. Useful for cron jobs. Errors are still written to stderr."
 	echo ""
 	echo "--user-agent <agent string>"
 	echo "	Sets the cURL user agent."
 	echo ""
 	echo "--verbose"
-	echo "	Enables verbose output."
+	echo "	Enables verbose output explaining cache decisions, transfers, content comparisons, backups"
+	echo "	and file publication. Cannot be combined with ‘--quiet’."
 	echo ""
 	echo "Parameters:"
 	echo "==========="
 	echo "--output <file>"
 	echo "	The path including the filename where the downloaded file should be stored."
+	echo "	The directory must already exist and be writable. The output must be a regular file or a new name."
+	echo "	Symlinks and special files are rejected, as are names ending in ‘.’, ‘ibfu-meta’ or ‘ibfu-lock’."
+	echo "	Updates to the same output wait on ‘.<file>.ibfu-lock’; do not remove this persistent lock file."
+	echo "	The active file is replaced atomically. Backups and meta data are finalized separately; an error"
+	echo "	after publication reports that the new file is already active. Staged backups remain for recovery."
 	echo ""
 	echo "--version"
 	echo "	Output version information and exit."
